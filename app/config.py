@@ -14,8 +14,10 @@ class Settings(BaseSettings):
     anthropic_api_key: str
     anthropic_model: str = "claude-haiku-4-5-20251001"
     database_url: str = "sqlite:///./data/seen.db"
-    scrape_interval_minutes: int = 60
+    scrape_hours: str = "8,13,18"
     max_chars: int = 12000
+    anthropic_rpm: int = 35
+    anthropic_tpm: int = 45000
 
 
 @lru_cache
