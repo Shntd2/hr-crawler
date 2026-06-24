@@ -1,0 +1,10 @@
+services:
+  hr-crawler:
+    build: .
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

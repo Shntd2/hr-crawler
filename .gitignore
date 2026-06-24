@@ -118,6 +118,8 @@ temp/
 *.sqlite
 *.db
 
-app/data/
-water_bot.log
+data/
 .idea/
+data
+
+/config
