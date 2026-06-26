@@ -17,7 +17,10 @@ class LLMScraper(BaseScraper):
         self.url = source["url"]
 
     async def fetch(self):
-        launch: dict = {"headless": True}
+        launch: dict = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+        }
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(**launch)
