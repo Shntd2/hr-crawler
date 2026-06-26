@@ -1,4 +1,4 @@
-from playwright.async_api import async_playwright
+from playwright.async_api import Browser
 from selectolax.parser import HTMLParser
 from app.scrapers.base import BaseScraper
 from app.extractor import extract_vacancies, infer_selectors
@@ -10,26 +10,25 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+LAUNCH_ARGS = {
+    "headless": True,
+    "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+}
+
 
 class LLMScraper(BaseScraper):
     def __init__(self, source: dict):
         self.name = source["name"]
         self.url = source["url"]
 
-    async def fetch(self):
-        launch: dict = {
-            "headless": True,
-            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
-        }
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(**launch)
-            page = await browser.new_page(user_agent=UA)
-            try:
-                await page.goto(self.url, wait_until="networkidle", timeout=45000)
-                html = await page.content()
-            finally:
-                await browser.close()
+    async def fetch(self, browser: Browser):
+        page = await browser.new_page(user_agent=UA)
+        try:
+            await page.goto(self.url, wait_until="load", timeout=45000)
+            await page.wait_for_timeout(3000)
+            html = await page.content()
+        finally:
+            await page.close()
 
         tree = HTMLParser(html)
         for tag in tree.css("script, style, nav, footer, svg"):
