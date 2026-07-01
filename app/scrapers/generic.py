@@ -4,6 +4,7 @@ from selectolax.parser import HTMLParser
 from app.schemas import Vacancy
 from app.scrapers.base import BaseScraper
 from app.state import get_conditional_headers, save_validators
+from app.selectors import invalidate_selectors
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; JobRadar/1.0)"}
 
@@ -24,8 +25,14 @@ class GenericScraper(BaseScraper):
         save_validators(url, r.headers)
 
         tree = HTMLParser(r.text)
+        try:
+            items = tree.css(self.s["item_selector"])
+        except Exception:
+            invalidate_selectors(url)
+            raise
+
         out: list[Vacancy] = []
-        for item in tree.css(self.s["item_selector"]):
+        for item in items:
             t = item.css_first(self.s["title_selector"])
             link = item.css_first(self.s["link_selector"])
             if not (t and link):

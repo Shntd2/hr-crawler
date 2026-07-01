@@ -27,6 +27,11 @@ class RateLimiter:
         self._token_usage: deque[tuple[float, int]] = deque()
 
     async def acquire(self, estimated_tokens: int) -> None:
+        if estimated_tokens > self._max_tokens_per_minute:
+            raise ValueError(
+                f"estimated_tokens={estimated_tokens} exceeds anthropic_tpm budget "
+                f"({self._max_tokens_per_minute}); request can never be admitted"
+            )
         async with self._lock:
             while True:
                 now = time.monotonic()
@@ -130,6 +135,13 @@ SELECTOR_TOOL = {
 }
 
 
+_PLACEHOLDER_SELECTOR_VALUES = {"", "<unknown>", "unknown", "n/a", "none", "null"}
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    return value.strip().lower() in _PLACEHOLDER_SELECTOR_VALUES
+
+
 async def infer_selectors(content: str) -> dict | None:
     s = get_settings()
     truncated = content[: s.max_chars]
@@ -148,12 +160,14 @@ async def infer_selectors(content: str) -> dict | None:
     for block in resp.content:
         if block.type == "tool_use" and block.name == "emit_selectors":
             data = block.input
-            if not (data.get("item_selector") and data.get("title_selector") and data.get("link_selector")):
+            keys = ("item_selector", "title_selector", "link_selector")
+            selectors = {k: (data.get(k) or "") for k in keys}
+            if not all(selectors.values()):
+                return None
+            if any(_looks_like_placeholder(v) for v in selectors.values()):
                 return None
             return {
-                "item_selector": data["item_selector"],
-                "title_selector": data["title_selector"],
-                "link_selector": data["link_selector"],
+                **selectors,
                 "location_selector": data.get("location_selector") or None,
             }
     return None
@@ -196,8 +210,17 @@ def _chunk_content(content: str, max_chars: int) -> list[str]:
     root = HTMLParser(content).body
     fragments = _element_fragments(root, max_chars) if root is not None else []
     if not fragments:
-        return [content[i: i + max_chars] for i in range(0, len(content), max_chars)]
-    return _pack_fragments(fragments, max_chars)
+        chunks = [content[i: i + max_chars] for i in range(0, len(content), max_chars)]
+    else:
+        chunks = _pack_fragments(fragments, max_chars)
+
+    out: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            out.append(chunk)
+        else:
+            out.extend(chunk[i: i + max_chars] for i in range(0, len(chunk), max_chars))
+    return out
 
 
 async def _extract_chunk(content: str, source: str, base_url: str) -> list[Vacancy]:
@@ -238,14 +261,18 @@ async def _extract_chunk(content: str, source: str, base_url: str) -> list[Vacan
     return out
 
 
-async def extract_vacancies(content: str, source: str, base_url: str) -> list[Vacancy]:
+async def extract_vacancies(content: str, source: str, base_url: str) -> tuple[list[Vacancy], str | None]:
     s = get_settings()
     seen_links: set[str] = set()
     out: list[Vacancy] = []
+    matched_chunk: str | None = None
     for chunk in _chunk_content(content, s.max_chars):
-        for v in await _extract_chunk(chunk, source, base_url):
+        chunk_vacancies = await _extract_chunk(chunk, source, base_url)
+        if chunk_vacancies and matched_chunk is None:
+            matched_chunk = chunk
+        for v in chunk_vacancies:
             if v.link in seen_links:
                 continue
             seen_links.add(v.link)
             out.append(v)
-    return out
+    return out, matched_chunk
