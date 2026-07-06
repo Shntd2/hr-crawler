@@ -1,10 +1,13 @@
+import logging
 import httpx
 from urllib.parse import urljoin
 from selectolax.parser import HTMLParser
 from app.schemas import Vacancy
 from app.scrapers.base import BaseScraper
 from app.state import get_conditional_headers, save_validators
-from app.selectors import invalidate_selectors
+from app.selectors import EMPTY_STREAK_LIMIT, invalidate_selectors, record_match_result
+
+log = logging.getLogger("scrapers.generic")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; JobRadar/1.0)"}
 
@@ -52,4 +55,13 @@ class GenericScraper(BaseScraper):
             invalidate_selectors(url)
             raise
 
-        return parse_with_selectors(items, self.s, self.s["name"], self.s.get("base_url", url))
+        if record_match_result(url, matched=bool(items)):
+            log.warning(
+                "selector for %s stopped matching after %d consecutive empty scrapes; "
+                "invalidated for re-learning",
+                url,
+                EMPTY_STREAK_LIMIT,
+            )
+
+        base_url = self.s.get("base_url") or str(r.url)
+        return parse_with_selectors(items, self.s, self.s["name"], base_url)

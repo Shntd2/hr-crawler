@@ -266,10 +266,12 @@ async def extract_vacancies(content: str, source: str, base_url: str) -> tuple[l
     seen_links: set[str] = set()
     out: list[Vacancy] = []
     matched_chunk: str | None = None
+    matched_chunk_count = 0
     for chunk in _chunk_content(content, s.max_chars):
         chunk_vacancies = await _extract_chunk(chunk, source, base_url)
-        if chunk_vacancies and matched_chunk is None:
+        if len(chunk_vacancies) > matched_chunk_count:
             matched_chunk = chunk
+            matched_chunk_count = len(chunk_vacancies)
         for v in chunk_vacancies:
             if v.link in seen_links:
                 continue

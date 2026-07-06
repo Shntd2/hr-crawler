@@ -37,3 +37,4 @@ class LearnedSelector(Base):
     location_selector: Mapped[str | None] = mapped_column(String, nullable=True)
     stable_count: Mapped[int] = mapped_column(Integer, default=1)
     verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    empty_streak: Mapped[int] = mapped_column(Integer, default=0)

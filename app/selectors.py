@@ -3,6 +3,8 @@ from app.db import SessionLocal
 from app.models import LearnedSelector
 
 STABILITY_THRESHOLD = 2
+EMPTY_STREAK_LIMIT = 3
+VALIDATION_SAMPLE_SIZE = 5
 
 
 def validate_selectors(html: str, selectors: dict) -> bool:
@@ -12,15 +14,15 @@ def validate_selectors(html: str, selectors: dict) -> bool:
         return False
     if not items:
         return False
-    item = items[0]
-    try:
-        has_title = item.css_first(selectors["title_selector"]) is not None
-        link = item.css_first(selectors["link_selector"])
-    except Exception:
-        return False
-    if not has_title or link is None:
-        return False
-    return bool((link.attributes.get("href") or "").strip())
+    for item in items[:VALIDATION_SAMPLE_SIZE]:
+        try:
+            has_title = item.css_first(selectors["title_selector"]) is not None
+            link = item.css_first(selectors["link_selector"])
+        except Exception:
+            continue
+        if has_title and link is not None and (link.attributes.get("href") or "").strip():
+            return True
+    return False
 
 
 def invalidate_selectors(url: str) -> None:
@@ -55,6 +57,25 @@ def get_stored_selectors(url: str) -> dict | None:
             "link_selector": row.link_selector,
             "location_selector": row.location_selector,
         }
+
+
+def record_match_result(url: str, matched: bool) -> bool:
+    with SessionLocal() as db:
+        row = db.get(LearnedSelector, url)
+        if not row:
+            return False
+        if matched:
+            if row.empty_streak:
+                row.empty_streak = 0
+                db.commit()
+            return False
+        row.empty_streak += 1
+        if row.empty_streak >= EMPTY_STREAK_LIMIT:
+            db.delete(row)
+            db.commit()
+            return True
+        db.commit()
+        return False
 
 
 def confirm_selectors(url: str) -> None:

@@ -33,6 +33,7 @@ class LLMScraper(BaseScraper):
             await page.goto(self.url, wait_until="load", timeout=45000)
             await page.wait_for_timeout(3000)
             html = await page.content()
+            final_url = page.url
         finally:
             await page.close()
 
@@ -48,9 +49,9 @@ class LLMScraper(BaseScraper):
         if stored and validate_selectors(cleaned, stored):
             confirm_selectors(self.url)
             items = HTMLParser(cleaned).css(stored["item_selector"])
-            return parse_with_selectors(items, stored, self.name, self.url)
+            return parse_with_selectors(items, stored, self.name, final_url)
 
-        vacancies, matched_chunk = await extract_vacancies(cleaned, self.name, self.url)
+        vacancies, matched_chunk = await extract_vacancies(cleaned, self.name, final_url)
         if vacancies:
             selectors = await infer_selectors(matched_chunk or cleaned)
             if selectors and validate_selectors(cleaned, selectors):
