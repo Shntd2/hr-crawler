@@ -1,9 +1,15 @@
 from playwright.async_api import Browser
 from selectolax.parser import HTMLParser
 from app.scrapers.base import BaseScraper
+from app.scrapers.generic import parse_with_selectors
 from app.extractor import extract_vacancies, infer_selectors
 from app.state import content_changed
-from app.selectors import record_inferred_selectors, validate_selectors
+from app.selectors import (
+    confirm_selectors,
+    get_stored_selectors,
+    record_inferred_selectors,
+    validate_selectors,
+)
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -37,6 +43,12 @@ class LLMScraper(BaseScraper):
 
         if not content_changed(self.url, cleaned):
             return []
+
+        stored = get_stored_selectors(self.url)
+        if stored and validate_selectors(cleaned, stored):
+            confirm_selectors(self.url)
+            items = HTMLParser(cleaned).css(stored["item_selector"])
+            return parse_with_selectors(items, stored, self.name, self.url)
 
         vacancies, matched_chunk = await extract_vacancies(cleaned, self.name, self.url)
         if vacancies:

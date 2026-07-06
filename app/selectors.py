@@ -44,6 +44,30 @@ def get_verified_selectors(url: str) -> dict | None:
         }
 
 
+def get_stored_selectors(url: str) -> dict | None:
+    with SessionLocal() as db:
+        row = db.get(LearnedSelector, url)
+        if not row:
+            return None
+        return {
+            "item_selector": row.item_selector,
+            "title_selector": row.title_selector,
+            "link_selector": row.link_selector,
+            "location_selector": row.location_selector,
+        }
+
+
+def confirm_selectors(url: str) -> None:
+    with SessionLocal() as db:
+        row = db.get(LearnedSelector, url)
+        if not row:
+            return
+        row.stable_count += 1
+        if row.stable_count >= STABILITY_THRESHOLD:
+            row.verified = True
+        db.commit()
+
+
 def record_inferred_selectors(url: str, selectors: dict) -> None:
     with SessionLocal() as db:
         row = db.get(LearnedSelector, url)
