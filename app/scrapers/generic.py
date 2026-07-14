@@ -1,11 +1,15 @@
 import logging
 import httpx
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin
 from selectolax.parser import HTMLParser
 from app.schemas import Vacancy
 from app.scrapers.base import BaseScraper
 from app.state import get_conditional_headers, save_validators
 from app.selectors import EMPTY_STREAK_LIMIT, invalidate_selectors, record_match_result
+
+if TYPE_CHECKING:
+    from playwright.async_api import Browser
 
 log = logging.getLogger("scrapers.generic")
 
@@ -35,9 +39,10 @@ def parse_with_selectors(items, selectors: dict, name: str, base_url: str) -> li
 
 class GenericScraper(BaseScraper):
     def __init__(self, source: dict):
+        super().__init__(source)
         self.s = source
 
-    async def fetch(self) -> list[Vacancy]:
+    async def fetch(self, browser: "Browser | None" = None) -> list[Vacancy]:
         url = self.s["url"]
         cond = get_conditional_headers(url)
         async with httpx.AsyncClient(timeout=20, headers={**HEADERS, **cond}) as client:

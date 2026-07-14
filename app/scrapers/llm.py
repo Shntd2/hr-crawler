@@ -24,14 +24,24 @@ LAUNCH_ARGS = {
 
 class LLMScraper(BaseScraper):
     def __init__(self, source: dict):
+        super().__init__(source)
         self.name = source["name"]
         self.url = source["url"]
 
-    async def fetch(self, browser: Browser):
+    async def fetch(self, browser: Browser | None = None):
+        if browser is None:
+            raise ValueError("LLMScraper.fetch requires a Playwright browser")
+        stored = get_stored_selectors(self.url)
         page = await browser.new_page(user_agent=UA)
         try:
             await page.goto(self.url, wait_until="load", timeout=45000)
-            await page.wait_for_timeout(3000)
+            if stored:
+                try:
+                    await page.wait_for_selector(stored["item_selector"], timeout=15000)
+                except Exception:
+                    await page.wait_for_timeout(3000)
+            else:
+                await page.wait_for_timeout(3000)
             html = await page.content()
             final_url = page.url
         finally:
@@ -45,7 +55,6 @@ class LLMScraper(BaseScraper):
         if not content_changed(self.url, cleaned):
             return []
 
-        stored = get_stored_selectors(self.url)
         if stored and validate_selectors(cleaned, stored):
             confirm_selectors(self.url)
             items = HTMLParser(cleaned).css(stored["item_selector"])
