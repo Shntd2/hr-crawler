@@ -94,15 +94,17 @@ def _estimate_tokens(*texts: str, max_tokens: int) -> int:
 
 _KEEP_ATTRS = {"class", "id", "href"}
 _MAX_CLASSES = 3
-_DROP_TAGS = "script, style, noscript, template, nav, footer, svg, img, picture, video, iframe, link, meta"
+_DROP_TAGS = "script, style, noscript, template, svg, img, picture, video, iframe, link, meta"
+# Dropped unless they mention an include keyword (some sites list jobs there).
+_CHROME_TAGS = "nav, footer"
 
 
-def compact_html(html: str) -> str:
+def compact_html(html: str, keep_keywords: list[str] | None = None) -> str:
     """Return a much smaller HTML string that keeps only what extraction needs.
 
     Keeps tags, text, href, id and the first few classes, so CSS selectors
     learned on the compact HTML keep working on it. Drops scripts, styles,
-    navigation, media, comments, all other attributes, empty leaf elements and
+    media, nav/footer blocks that mention none of keep_keywords, comments, all other attributes, empty leaf elements and
     redundant whitespace, which roughly halves the token count or better.
     """
     tree = HTMLParser(html)
@@ -111,6 +113,11 @@ def compact_html(html: str) -> str:
         return ""
     for node in root.css(_DROP_TAGS):
         node.decompose()
+    kw = [k.lower() for k in (keep_keywords or [])]
+    for node in root.css(_CHROME_TAGS):
+        text = (node.text(separator=" ") or "").lower()
+        if not any(k in text for k in kw):
+            node.decompose()
 
     nodes = list(root.traverse(include_text=False))
     for node in reversed(nodes):  # children before parents

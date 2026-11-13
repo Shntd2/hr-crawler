@@ -18,11 +18,18 @@ match `config/keywords.json`, and sends new ones to Telegram.
   first time and proposes CSS selectors; once the selectors validate on two
   runs they are used without any LLM call until they stop matching.
 
+Large pages are never truncated: the compact HTML is split into chunks on
+element boundaries and every chunk is considered, so vacancies at the very end
+of a page are found. Before reading the page, the scraper scrolls to the bottom
+until the height stops growing (up to 15 times), so lazy-loaded and
+infinite-scroll listings are in the DOM. `<nav>` and `<footer>` are kept when
+they mention an include keyword.
+
 ## Keeping Gemini token usage low
 
 | Measure | Where | Effect |
 | --- | --- | --- |
-| Compact HTML (keep tags, text, `href`, `id`, first 3 classes; drop scripts, styles, nav, footer, media, comments, other attributes, empty elements, whitespace) | `extractor.compact_html` | Roughly half the input tokens or less; also stops attribute churn from counting as a page change |
+| Compact HTML (keep tags, text, `href`, `id`, first 3 classes; drop scripts, styles, media, nav/footer without keywords, comments, other attributes, empty elements, whitespace) | `extractor.compact_html` | Roughly half the input tokens or less; also stops attribute churn from counting as a page change |
 | Skip unchanged pages (content hash, ETag / Last-Modified) | `state.py` | No call when nothing changed |
 | Learned selectors replace the LLM after 2 stable runs | `selectors.py` | Most runs make zero LLM calls |
 | One call returns vacancies **and** selectors | `extractor._extract_chunk` | Removes the second "infer selectors" request |
