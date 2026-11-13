@@ -1,8 +1,9 @@
 from playwright.async_api import Browser
 from selectolax.parser import HTMLParser
+from app.config import load_keywords
 from app.scrapers.base import BaseScraper
 from app.scrapers.generic import parse_with_selectors
-from app.extractor import extract_vacancies, infer_selectors
+from app.extractor import compact_html, extract_vacancies
 from app.state import content_changed
 from app.selectors import (
     confirm_selectors,
@@ -47,10 +48,12 @@ class LLMScraper(BaseScraper):
         finally:
             await page.close()
 
-        tree = HTMLParser(html)
-        for tag in tree.css("script, style, nav, footer, svg"):
-            tag.decompose()
-        cleaned = tree.body.html if tree.body else html
+        # Hashing, selector matching and the LLM all work on the same compact
+        # HTML, so attribute churn (tracking ids, inline styles) no longer counts
+        # as a page change and the LLM sees far fewer tokens.
+        cleaned = compact_html(html)
+        if not cleaned:
+            return []
 
         if not content_changed(self.url, cleaned):
             return []
@@ -60,9 +63,10 @@ class LLMScraper(BaseScraper):
             items = HTMLParser(cleaned).css(stored["item_selector"])
             return parse_with_selectors(items, stored, self.name, final_url)
 
-        vacancies, matched_chunk = await extract_vacancies(cleaned, self.name, final_url)
-        if vacancies:
-            selectors = await infer_selectors(matched_chunk or cleaned)
-            if selectors and validate_selectors(cleaned, selectors):
-                record_inferred_selectors(self.url, selectors)
+        include = load_keywords().get("include", [])
+        vacancies, selectors = await extract_vacancies(
+            cleaned, self.name, final_url, include_keywords=include
+        )
+        if vacancies and selectors and validate_selectors(cleaned, selectors):
+            record_inferred_selectors(self.url, selectors)
         return vacancies

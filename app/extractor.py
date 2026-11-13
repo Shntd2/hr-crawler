@@ -1,20 +1,39 @@
 import asyncio
+import json
+import logging
+import re
 import time
 from collections import deque
 from urllib.parse import urljoin
-from anthropic import AsyncAnthropic
+
+from google import genai
+from google.genai import types
 from selectolax.parser import HTMLParser
+
 from app.config import get_settings
 from app.schemas import Vacancy
 
-_client: AsyncAnthropic | None = None
+log = logging.getLogger("extractor")
+
+_client: genai.Client | None = None
 _rate_limiter: "RateLimiter | None" = None
 
+# Retry transient Gemini errors (rate limit / overload) inside the SDK.
+_RETRY = types.HttpRetryOptions(
+    attempts=4,
+    initial_delay=2.0,
+    max_delay=30.0,
+    http_status_codes=[429, 500, 503, 504],
+)
 
-def _get_client() -> AsyncAnthropic:
+
+def _get_client() -> genai.Client:
     global _client
     if _client is None:
-        _client = AsyncAnthropic(api_key=get_settings().anthropic_api_key)
+        _client = genai.Client(
+            api_key=get_settings().gemini_api_key,
+            http_options=types.HttpOptions(retry_options=_RETRY, timeout=120_000),
+        )
     return _client
 
 
@@ -29,7 +48,7 @@ class RateLimiter:
     async def acquire(self, estimated_tokens: int) -> None:
         if estimated_tokens > self._max_tokens_per_minute:
             raise ValueError(
-                f"estimated_tokens={estimated_tokens} exceeds anthropic_tpm budget "
+                f"estimated_tokens={estimated_tokens} exceeds llm_tpm budget "
                 f"({self._max_tokens_per_minute}); request can never be admitted"
             )
         async with self._lock:
@@ -61,7 +80,7 @@ def _get_rate_limiter() -> RateLimiter:
     global _rate_limiter
     if _rate_limiter is None:
         s = get_settings()
-        _rate_limiter = RateLimiter(s.anthropic_rpm, s.anthropic_tpm)
+        _rate_limiter = RateLimiter(s.llm_rpm, s.llm_tpm)
     return _rate_limiter
 
 
@@ -69,71 +88,109 @@ def _estimate_tokens(*texts: str, max_tokens: int) -> int:
     return sum(len(t) for t in texts) // 4 + max_tokens
 
 
+# ---------------------------------------------------------------------------
+# Token reduction: shrink HTML before it is hashed, parsed or sent to the LLM.
+# ---------------------------------------------------------------------------
+
+_KEEP_ATTRS = {"class", "id", "href"}
+_MAX_CLASSES = 3
+_DROP_TAGS = "script, style, noscript, template, nav, footer, svg, img, picture, video, iframe, link, meta"
+
+
+def compact_html(html: str) -> str:
+    """Return a much smaller HTML string that keeps only what extraction needs.
+
+    Keeps tags, text, href, id and the first few classes, so CSS selectors
+    learned on the compact HTML keep working on it. Drops scripts, styles,
+    navigation, media, comments, all other attributes, empty leaf elements and
+    redundant whitespace, which roughly halves the token count or better.
+    """
+    tree = HTMLParser(html)
+    root = tree.body or tree.root
+    if root is None:
+        return ""
+    for node in root.css(_DROP_TAGS):
+        node.decompose()
+
+    nodes = list(root.traverse(include_text=False))
+    for node in reversed(nodes):  # children before parents
+        if node.tag == "_comment":
+            node.decompose()
+            continue
+        attrs = node.attrs
+        for name in list(node.attributes):
+            if name not in _KEEP_ATTRS:
+                del attrs[name]
+        cls = node.attributes.get("class")
+        if cls:
+            parts = cls.split()
+            if len(parts) > _MAX_CLASSES:
+                attrs["class"] = " ".join(parts[:_MAX_CLASSES])
+        if (
+            node is not root
+            and node.child is None
+            and not node.attributes.get("href")
+            and not (node.text(deep=False) or "").strip()
+        ):
+            node.decompose()
+
+    out = root.html or ""
+    out = re.sub(r"\s+", " ", out)
+    return re.sub(r">\s+<", "><", out).strip()
+
+
+def chunk_has_keyword(chunk: str, include: list[str]) -> bool:
+    if not include:
+        return True
+    text = HTMLParser(chunk).text(separator=" ").lower()
+    return any(k.lower() in text for k in include)
+
+
+# ---------------------------------------------------------------------------
+# One Gemini call per chunk returns BOTH the vacancies and reusable selectors,
+# so we never pay a second request just to learn selectors.
+# ---------------------------------------------------------------------------
+
 SYSTEM = (
-    "You extract job vacancies from raw web page content. "
-    "Return only genuine job postings via the emit_vacancies tool. "
-    "Use 'N/A' when a location is missing. Always include the href/URL "
-    "for each posting exactly as it appears on the page."
+    "You extract job vacancies from compact HTML of a careers or job-board page. "
+    "Return only genuine job postings, not navigation, filters or blog links. "
+    "Copy each posting's href exactly as it appears in the HTML. "
+    "Use 'N/A' when a location is missing. "
+    "Also return CSS selectors that a plain HTML parser can use on this same HTML "
+    "to extract these postings without an LLM: item_selector matches each "
+    "repeated posting container; title_selector, link_selector and "
+    "location_selector are relative to the item. Use only tag names, classes and "
+    "ids that appear in the HTML. Set selectors to null if there are no postings."
 )
 
-TOOL = {
-    "name": "emit_vacancies",
-    "description": "Return every job vacancy found on the page.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "vacancies": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "location": {"type": "string"},
-                        "link": {"type": "string"},
-                    },
-                    "required": ["title", "link"],
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "vacancies": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "location": {"type": "string"},
+                    "link": {"type": "string"},
                 },
-            }
-        },
-        "required": ["vacancies"],
-    },
-}
-
-
-SELECTOR_SYSTEM = (
-    "You write minimal, robust CSS selectors that a simple HTML parser can use "
-    "to extract the same job vacancy listings you just identified on this page, "
-    "without needing an LLM. Selectors for title/link/location are relative to "
-    "the item element."
-)
-
-SELECTOR_TOOL = {
-    "name": "emit_selectors",
-    "description": "Return CSS selectors that locate the job vacancy listings on this page.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "item_selector": {
-                "type": "string",
-                "description": "Selector matching each repeated vacancy item container.",
-            },
-            "title_selector": {
-                "type": "string",
-                "description": "Selector, relative to the item, for the title/link element.",
-            },
-            "link_selector": {
-                "type": "string",
-                "description": "Selector, relative to the item, for the anchor with the href.",
-            },
-            "location_selector": {
-                "type": ["string", "null"],
-                "description": "Selector, relative to the item, for the location text, or null if none.",
+                "required": ["title", "link"],
             },
         },
-        "required": ["item_selector", "title_selector", "link_selector"],
+        "selectors": {
+            "type": ["object", "null"],
+            "properties": {
+                "item_selector": {"type": "string"},
+                "title_selector": {"type": "string"},
+                "link_selector": {"type": "string"},
+                "location_selector": {"type": ["string", "null"]},
+            },
+            "required": ["item_selector", "title_selector", "link_selector"],
+        },
     },
+    "required": ["vacancies", "selectors"],
 }
-
 
 _PLACEHOLDER_SELECTOR_VALUES = {"", "<unknown>", "unknown", "n/a", "none", "null"}
 
@@ -142,35 +199,50 @@ def _looks_like_placeholder(value: str) -> bool:
     return value.strip().lower() in _PLACEHOLDER_SELECTOR_VALUES
 
 
-async def infer_selectors(content: str) -> dict | None:
-    s = get_settings()
-    truncated = content[: s.max_chars]
-    await _get_rate_limiter().acquire(
-        _estimate_tokens(SELECTOR_SYSTEM, truncated, max_tokens=512)
-    )
-    resp = await _get_client().messages.create(
-        model=s.anthropic_model,
-        max_tokens=512,
-        system=[{"type": "text", "text": SELECTOR_SYSTEM}],
-        tools=[SELECTOR_TOOL],
-        tool_choice={"type": "tool", "name": "emit_selectors"},
-        messages=[{"role": "user", "content": truncated}],
-    )
+def _clean_selectors(data: dict | None) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    keys = ("item_selector", "title_selector", "link_selector")
+    selectors = {k: (data.get(k) or "") for k in keys}
+    if not all(selectors.values()):
+        return None
+    if any(_looks_like_placeholder(v) for v in selectors.values()):
+        return None
+    return {**selectors, "location_selector": data.get("location_selector") or None}
 
-    for block in resp.content:
-        if block.type == "tool_use" and block.name == "emit_selectors":
-            data = block.input
-            keys = ("item_selector", "title_selector", "link_selector")
-            selectors = {k: (data.get(k) or "") for k in keys}
-            if not all(selectors.values()):
-                return None
-            if any(_looks_like_placeholder(v) for v in selectors.values()):
-                return None
-            return {
-                **selectors,
-                "location_selector": data.get("location_selector") or None,
-            }
-    return None
+
+def _generation_config() -> types.GenerateContentConfig:
+    s = get_settings()
+    kwargs: dict = {
+        "system_instruction": SYSTEM,
+        "response_mime_type": "application/json",
+        "response_json_schema": RESPONSE_SCHEMA,
+        "max_output_tokens": s.gemini_max_output_tokens,
+        # Never let the SDK silently re-send the request to finish a long answer.
+        "automatic_continuation": False,
+    }
+    if s.gemini_thinking_level:
+        kwargs["thinking_config"] = types.ThinkingConfig(
+            thinking_level=s.gemini_thinking_level.upper()
+        )
+    if s.gemini_service_tier and s.gemini_service_tier.lower() != "standard":
+        kwargs["service_tier"] = s.gemini_service_tier.lower()
+    return types.GenerateContentConfig(**kwargs)
+
+
+def _log_usage(source: str, resp) -> None:
+    u = getattr(resp, "usage_metadata", None)
+    if not u:
+        return
+    log.info(
+        "gemini usage source=%s prompt=%s cached=%s output=%s thinking=%s total=%s",
+        source,
+        u.prompt_token_count,
+        u.cached_content_token_count or 0,
+        u.candidates_token_count,
+        u.thoughts_token_count or 0,
+        u.total_token_count,
+    )
 
 
 def _element_fragments(node, max_chars: int) -> list[str]:
@@ -223,30 +295,29 @@ def _chunk_content(content: str, max_chars: int) -> list[str]:
     return out
 
 
-async def _extract_chunk(content: str, source: str, base_url: str) -> list[Vacancy]:
+async def _extract_chunk(
+    content: str, source: str, base_url: str
+) -> tuple[list[Vacancy], dict | None]:
     s = get_settings()
     await _get_rate_limiter().acquire(
-        _estimate_tokens(SYSTEM, content, max_tokens=2048)
+        _estimate_tokens(SYSTEM, content, max_tokens=s.gemini_max_output_tokens)
     )
-    resp = await _get_client().messages.create(
-        model=s.anthropic_model,
-        max_tokens=2048,
-        cache_control={"type": "ephemeral"},
-        system=[{"type": "text", "text": SYSTEM,
-                 "cache_control": {"type": "ephemeral"}}],
-        tools=[TOOL],
-        tool_choice={"type": "tool", "name": "emit_vacancies"},
-        messages=[{"role": "user", "content": content}],
+    resp = await _get_client().aio.models.generate_content(
+        model=s.gemini_model,
+        contents=content,
+        config=_generation_config(),
     )
+    _log_usage(source, resp)
 
-    items: list[dict] = []
-    for block in resp.content:
-        if block.type == "tool_use" and block.name == "emit_vacancies":
-            items = block.input.get("vacancies", [])
-            break
+    try:
+        data = json.loads(resp.text or "{}")
+    except json.JSONDecodeError:
+        log.warning("gemini returned invalid JSON for %s (finish=%s)", source,
+                    resp.candidates[0].finish_reason if resp.candidates else None)
+        return [], None
 
     out: list[Vacancy] = []
-    for v in items:
+    for v in data.get("vacancies") or []:
         link = (v.get("link") or "").strip()
         if not link:
             continue
@@ -258,23 +329,38 @@ async def _extract_chunk(content: str, source: str, base_url: str) -> list[Vacan
                 source=source,
             )
         )
-    return out
+    return out, _clean_selectors(data.get("selectors"))
 
 
-async def extract_vacancies(content: str, source: str, base_url: str) -> tuple[list[Vacancy], str | None]:
+async def extract_vacancies(
+    content: str, source: str, base_url: str, include_keywords: list[str] | None = None
+) -> tuple[list[Vacancy], dict | None]:
+    """Extract vacancies from compact HTML.
+
+    Returns the vacancies and the selectors proposed for the chunk that yielded
+    the most vacancies (or None). Chunks that mention none of the include
+    keywords are skipped when the keyword gate is on.
+    """
     s = get_settings()
+    gate = include_keywords if s.llm_keyword_gate else None
     seen_links: set[str] = set()
     out: list[Vacancy] = []
-    matched_chunk: str | None = None
-    matched_chunk_count = 0
+    best_selectors: dict | None = None
+    best_count = 0
+    skipped = 0
     for chunk in _chunk_content(content, s.max_chars):
-        chunk_vacancies = await _extract_chunk(chunk, source, base_url)
-        if len(chunk_vacancies) > matched_chunk_count:
-            matched_chunk = chunk
-            matched_chunk_count = len(chunk_vacancies)
+        if gate and not chunk_has_keyword(chunk, gate):
+            skipped += 1
+            continue
+        chunk_vacancies, selectors = await _extract_chunk(chunk, source, base_url)
+        if selectors and len(chunk_vacancies) > best_count:
+            best_selectors = selectors
+            best_count = len(chunk_vacancies)
         for v in chunk_vacancies:
             if v.link in seen_links:
                 continue
             seen_links.add(v.link)
             out.append(v)
-    return out, matched_chunk
+    if skipped:
+        log.info("skipped %d chunk(s) without keywords for %s", skipped, source)
+    return out, best_selectors
