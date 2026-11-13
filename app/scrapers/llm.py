@@ -1,8 +1,9 @@
 from playwright.async_api import Browser
 from selectolax.parser import HTMLParser
+from app.config import load_keywords
 from app.scrapers.base import BaseScraper
 from app.scrapers.generic import parse_with_selectors
-from app.extractor import extract_vacancies, infer_selectors
+from app.extractor import compact_html, extract_vacancies
 from app.state import content_changed
 from app.selectors import (
     confirm_selectors,
@@ -15,6 +16,23 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+MAX_SCROLLS = 15
+SCROLL_PAUSE_MS = 1000
+
+
+async def _scroll_to_end(page) -> None:
+    """Scroll until the page stops growing, so lazy-loaded / infinite-scroll
+    vacancies at the end of the page are in the DOM before we read it."""
+    last_height = 0
+    for _ in range(MAX_SCROLLS):
+        height = await page.evaluate("document.body ? document.body.scrollHeight : 0")
+        if height == last_height:
+            break
+        last_height = height
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(SCROLL_PAUSE_MS)
+
 
 LAUNCH_ARGS = {
     "headless": True,
@@ -42,15 +60,22 @@ class LLMScraper(BaseScraper):
                     await page.wait_for_timeout(3000)
             else:
                 await page.wait_for_timeout(3000)
+            try:
+                await _scroll_to_end(page)
+            except Exception:
+                pass
             html = await page.content()
             final_url = page.url
         finally:
             await page.close()
 
-        tree = HTMLParser(html)
-        for tag in tree.css("script, style, nav, footer, svg"):
-            tag.decompose()
-        cleaned = tree.body.html if tree.body else html
+        # Hashing, selector matching and the LLM all work on the same compact
+        # HTML, so attribute churn (tracking ids, inline styles) no longer counts
+        # as a page change and the LLM sees far fewer tokens.
+        include = load_keywords().get("include", [])
+        cleaned = compact_html(html, keep_keywords=include)
+        if not cleaned:
+            return []
 
         if not content_changed(self.url, cleaned):
             return []
@@ -60,9 +85,9 @@ class LLMScraper(BaseScraper):
             items = HTMLParser(cleaned).css(stored["item_selector"])
             return parse_with_selectors(items, stored, self.name, final_url)
 
-        vacancies, matched_chunk = await extract_vacancies(cleaned, self.name, final_url)
-        if vacancies:
-            selectors = await infer_selectors(matched_chunk or cleaned)
-            if selectors and validate_selectors(cleaned, selectors):
-                record_inferred_selectors(self.url, selectors)
+        vacancies, selectors = await extract_vacancies(
+            cleaned, self.name, final_url, include_keywords=include
+        )
+        if vacancies and selectors and validate_selectors(cleaned, selectors):
+            record_inferred_selectors(self.url, selectors)
         return vacancies
